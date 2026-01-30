@@ -2,6 +2,10 @@
 HR AI Assistant - Main Application
 Production-ready FastAPI application for HR Operations
 """
+# === SSL BYPASS - MUST BE FIRST IMPORT ===
+import ssl_bypass  # noqa: F401
+# === END SSL BYPASS ===
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
