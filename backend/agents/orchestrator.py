@@ -2,15 +2,13 @@
 HR Orchestrator Agent
 Main agent that coordinates all HR operations using LangGraph
 """
-import os
+import asyncio
 from typing import Literal, Any, Dict, List
 from datetime import date
 
 from langchain_mistralai import ChatMistralAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 
 from config.settings import get_settings, setup_langsmith
@@ -18,7 +16,7 @@ from models.schemas import AgentState
 from services.vector_store import HRVectorStore
 from services.hr_api_client import HRSystemClient
 from agents.policy_agent import HRPolicyAgent
-from agents.tools import HR_TOOLS, set_hr_client
+from agents.tools import HR_TOOLS, set_hr_client, get_leave_balance, submit_leave_request, get_pay_stubs
 
 
 class HROrchestrator:
@@ -54,6 +52,13 @@ class HROrchestrator:
         )
         self.llm_with_tools = self.llm.bind_tools(HR_TOOLS)
 
+        # Tool mapping for direct execution
+        self.tool_map = {
+            "get_leave_balance": get_leave_balance,
+            "submit_leave_request": submit_leave_request,
+            "get_pay_stubs": get_pay_stubs,
+        }
+
         # Intent classifier
         self.classifier_prompt = ChatPromptTemplate.from_messages([
             ("system", """You are an intent classifier for an HR AI Assistant. Classify the user's query into ONE of these categories:
@@ -79,8 +84,7 @@ Respond with ONLY the category name, nothing else."""),
         workflow.add_node("classify_intent", self._classify_intent)
         workflow.add_node("policy_rag", self._handle_policy_question)
         workflow.add_node("tool_agent", self._call_tool_agent)
-        workflow.add_node("tool_executor", ToolNode(HR_TOOLS))
-        workflow.add_node("process_tool_result", self._process_tool_result)
+        workflow.add_node("execute_tools", self._execute_tools)
         workflow.add_node("general_response", self._handle_general)
         workflow.add_node("finalize", self._finalize_response)
 
@@ -98,19 +102,18 @@ Respond with ONLY the category name, nothing else."""),
             }
         )
 
-        # Tool agent routing
+        # Tool agent routing - check if tools need to be executed
         workflow.add_conditional_edges(
             "tool_agent",
-            self._should_continue_tools,
+            self._should_execute_tools,
             {
-                "tools": "tool_executor",
-                "end": "finalize"
+                "execute": "execute_tools",
+                "skip": "finalize"
             }
         )
 
-        # After tool execution, process results
-        workflow.add_edge("tool_executor", "process_tool_result")
-        workflow.add_edge("process_tool_result", "finalize")
+        # After tool execution, go to finalize
+        workflow.add_edge("execute_tools", "finalize")
 
         # All paths lead to finalize then END
         workflow.add_edge("policy_rag", "finalize")
@@ -158,7 +161,7 @@ Respond with ONLY the category name, nothing else."""),
         return {"policy_response": response}
 
     def _call_tool_agent(self, state: AgentState) -> dict:
-        """Call the tool-equipped agent"""
+        """Call the tool-equipped agent to determine which tools to use"""
         print("\n" + "=" * 50)
         print("🔧 Tool Agent")
         print("=" * 50)
@@ -191,33 +194,62 @@ If information is missing for a leave request, ask the user to provide it."""
                     "name": tc["name"],
                     "args": tc["args"]
                 })
-            print(f"Tool calls: {tool_calls}")
+            print(f"Tool calls identified: {tool_calls}")
 
-        return {
-            "messages": [{"role": "assistant", "content": response.content, "tool_calls": response.tool_calls if hasattr(response, 'tool_calls') else []}],
-            "tool_calls": tool_calls
-        }
+        # If no tool calls but there's content, use that as the response
+        if not tool_calls and response.content:
+            return {"policy_response": response.content, "tool_calls": []}
 
-    def _should_continue_tools(self, state: AgentState) -> Literal["tools", "end"]:
+        return {"tool_calls": tool_calls}
+
+    def _should_execute_tools(self, state: AgentState) -> Literal["execute", "skip"]:
         """Determine if tools should be executed"""
-        if state.messages and state.messages[-1].get("tool_calls"):
-            return "tools"
-        return "end"
+        if state.tool_calls and len(state.tool_calls) > 0:
+            return "execute"
+        return "skip"
 
-    def _process_tool_result(self, state: AgentState) -> dict:
-        """Process tool execution results"""
+    def _execute_tools(self, state: AgentState) -> dict:
+        """Execute the tools directly"""
         print("\n" + "=" * 50)
-        print("📋 Processing Tool Results")
+        print("⚙️ Executing Tools")
         print("=" * 50)
 
-        # Get the last message which should be the tool result
-        if state.messages:
-            last_message = state.messages[-1]
-            if isinstance(last_message, dict) and "content" in last_message:
-                print(f"Tool result received")
-                return {"policy_response": last_message.get("content", "")}
+        results = []
 
-        return {}
+        for tool_call in state.tool_calls:
+            tool_name = tool_call["name"]
+            tool_args = tool_call["args"]
+
+            print(f"Executing: {tool_name} with args: {tool_args}")
+
+            if tool_name in self.tool_map:
+                tool_func = self.tool_map[tool_name]
+                try:
+                    # Execute tool asynchronously
+                    result = asyncio.get_event_loop().run_until_complete(
+                        tool_func.ainvoke(tool_args)
+                    )
+                    results.append(result)
+                    print(f"Tool result: {result[:100]}..." if len(str(result)) > 100 else f"Tool result: {result}")
+                except RuntimeError:
+                    # If no event loop, create one
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        result = loop.run_until_complete(tool_func.ainvoke(tool_args))
+                        results.append(result)
+                    finally:
+                        loop.close()
+                except Exception as e:
+                    print(f"Error executing tool {tool_name}: {e}")
+                    results.append(f"Error executing {tool_name}: {str(e)}")
+            else:
+                results.append(f"Unknown tool: {tool_name}")
+
+        # Combine results
+        combined_result = "\n\n".join(results) if results else "No results from tools."
+
+        return {"policy_response": combined_result}
 
     def _handle_general(self, state: AgentState) -> dict:
         """Handle general queries and greetings"""
@@ -251,21 +283,10 @@ How can I assist you today?"""
         print("✅ Finalizing Response")
         print("=" * 50)
 
-        # Determine final response
-        final_response = ""
+        # Use policy_response as final response
+        final_response = state.policy_response if state.policy_response else ""
 
-        # Check for tool execution results in messages
-        for msg in reversed(state.messages):
-            if isinstance(msg, dict):
-                if msg.get("role") == "tool" or "Tool output" in str(msg.get("content", "")):
-                    final_response = msg.get("content", "")
-                    break
-
-        # If no tool result, use policy response
-        if not final_response and state.policy_response:
-            final_response = state.policy_response
-
-        # Default response
+        # Default response if nothing else
         if not final_response:
             final_response = "I apologize, but I couldn't process your request. Please try again or contact HR directly."
 
